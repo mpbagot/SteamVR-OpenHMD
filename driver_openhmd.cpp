@@ -173,6 +173,79 @@ public:
         } else {
             rcindex = unObjectId;
         }
+
+        PropertyContainerHandle_t ulPropertyContainer = vr::VRProperties()->TrackedDeviceToPropertyContainer(unObjectId);
+
+        // Set up button components
+        ohmd_device* d = index == 0 ? lcontroller : rcontroller;
+
+        // Get the control count
+        int control_count;
+        ohmd_device_geti(d, OHMD_CONTROL_COUNT, &control_count);
+
+        // Create Component Handle array
+        component_handles = (vr::VRInputComponentHandle_t*)malloc((control_count + 1)* sizeof(VRInputComponentHandle_t));
+
+        // Then, fetch the control types and hints
+        int *control_types, *control_hints;
+        control_types = (int*)malloc(control_count * sizeof(int));
+        control_hints = (int*)malloc(control_count * sizeof(int));
+        ohmd_device_geti(d, OHMD_CONTROLS_TYPES, control_types);
+        ohmd_device_geti(d, OHMD_CONTROLS_HINTS, control_hints);
+
+        const char *button_actions[13];
+
+        // Skip Select and Start so they can be used for calibration stuff
+        if (index == 0) {
+          // Right controller
+          button_actions[5] = "/input/application_menu/click";
+        } else {
+          // Left controller
+          button_actions[2] = "/input/application_menu/click";
+        }
+        button_actions[3] = "/input/grip/click";
+        button_actions[4] = "/input/grip/click";
+        button_actions[6] = "/input/system/click";
+        button_actions[7] = "/input/trackpad/touch";
+        button_actions[8] = "/input/trigger/value";
+
+        button_actions[9] = "/input/trigger/click";
+        button_actions[10] = "/input/trackpad/click";
+
+        button_actions[11] = "/input/trackpad/x";
+        button_actions[12] = "/input/trackpad/y";
+
+        // /input/system/click //
+        // /input/grip/click //
+        // /input/application_menu/click //
+        // /input/trigger/click //
+        // /input/trigger/value //
+        // /input/trackpad/x //
+        // /input/trackpad/y //
+        // /input/trackpad/click //
+        // /input/trackpad/touch //
+        // /output/haptic
+
+        for (int i = 0; i < control_count; i++) {
+            if (button_actions[i] == NULL) continue;
+
+            if (control_types[i] == OHMD_DIGITAL) {
+                // Create a boolean button component
+                vr::VRDriverInput()->CreateBooleanComponent(ulPropertyContainer, button_actions[i], &component_handles[i]);
+
+            } else if (control_types[i] == OHMD_ANALOG) {
+                // Create a scalar analog component
+                if (control_hints[i] == OHMD_TRIGGER) {
+                    vr::VRDriverInput()->CreateScalarComponent(ulPropertyContainer, button_actions[i], &component_handles[i], vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedOneSided);
+                } else if (control_hints[i] == OHMD_ANALOG_X || control_hints[i] == OHMD_ANALOG_Y) {
+                    vr::VRDriverInput()->CreateScalarComponent(ulPropertyContainer, button_actions[i], &component_handles[i], vr::VRScalarType_Absolute, vr::VRScalarUnits_NormalizedTwoSided);
+                }
+            }
+        }
+
+        // Create Haptic component
+        // CreateHapticComponent(ulPropertyContainer, "/output/haptic", &component_handles[control_count]);
+
         return VRInitError_None;
     }
 
@@ -206,6 +279,42 @@ public:
     {
         if( unResponseBufferSize >= 1 )
             pchResponseBuffer[0] = 0;
+    }
+
+    void RunFrame()
+    {
+        // Update the buttons and triggers
+        int control_count;
+        ohmd_device* d = index == 0 ? lcontroller : rcontroller;
+
+        // Get the control count
+        ohmd_device_geti(d, OHMD_CONTROL_COUNT, &control_count);
+
+        // Get the values for the inputs from the controller
+        float *button_values;
+        button_values = (float*)malloc(control_count * sizeof(float));
+        ohmd_device_getf(d, OHMD_CONTROLS_STATE, button_values);
+
+        // Then, fetch the control types and hints
+        int *control_types;
+        control_types = (int*)malloc(control_count * sizeof(int));
+        ohmd_device_geti(d, OHMD_CONTROLS_TYPES, control_types);
+
+        for (int i = 2; i < control_count; i++) {
+            if (control_types[i] == OHMD_DIGITAL) {
+                // Update a boolean button component
+                vr::VRDriverInput()->UpdateBooleanComponent(component_handles[i], button_values[i], 0.0f);
+            } else if (control_types[i] == OHMD_ANALOG) {
+                // Update a scalar analog component
+                vr::VRDriverInput()->UpdateScalarComponent(component_handles[i], button_values[i], 0.0f);
+            }
+        }
+
+        printf("Trackpad: X: %f, Y: %f\n", button_values[11], button_values[12]);
+
+        // TODO Use button_values 0 and 1 to update calibration
+
+        // TODO Use button_values 2 or 5 to update hmd rotation
     }
 
     DriverPose_t GetPose()
@@ -272,6 +381,8 @@ public:
 private:
     std::string m_sSerialNumber = "Controller serial number " + std::to_string(index);
     std::string m_sModelNumber = "Controller model number " + std::to_string(index);
+
+    VRInputComponentHandle_t* component_handles;
 };
 
 class COpenHMDDeviceDriver final : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponent
@@ -807,10 +918,17 @@ public:
         if ( m_unObjectId != vr::k_unTrackedDeviceIndexInvalid )
         {
             vr::VRServerDriverHost()->TrackedDevicePoseUpdated( m_unObjectId, GetPose(), sizeof( DriverPose_t ) );
-            if (m_OpenHMDDeviceDriverControllerL->exists())
+            if (m_OpenHMDDeviceDriverControllerL->exists()) {
+                // Update buttons/trigger
+                m_OpenHMDDeviceDriverControllerL->RunFrame();
+
                 vr::VRServerDriverHost()->TrackedDevicePoseUpdated( lcindex, m_OpenHMDDeviceDriverControllerL->GetPose(), sizeof( DriverPose_t ) );
-            if (m_OpenHMDDeviceDriverControllerR->exists())
+            }
+            if (m_OpenHMDDeviceDriverControllerR->exists()) {
+                m_OpenHMDDeviceDriverControllerR->RunFrame();
+
                 vr::VRServerDriverHost()->TrackedDevicePoseUpdated( rcindex, m_OpenHMDDeviceDriverControllerR->GetPose(), sizeof( DriverPose_t ) );
+            }
         }
     }
 
