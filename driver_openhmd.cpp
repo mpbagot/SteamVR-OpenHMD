@@ -28,10 +28,12 @@ using namespace vr;
 #define HMD_DLL_IMPORT extern "C" __declspec( dllimport )
 #elif defined(__GNUC__) || defined(COMPILER_GCC) || defined(__APPLE__)
 #define HMD_DLL_EXPORT extern "C" __attribute__((visibility("default")))
-#define HMD_DLL_IMPORT extern "C" 
+#define HMD_DLL_IMPORT extern "C"
 #else
 #error "Unsupported Platform."
 #endif
+
+#define CLOCKS_PER_MS (CLOCKS_PER_SEC / 1000)
 
 ohmd_context* ctx;
 ohmd_device* hmd = NULL;
@@ -39,6 +41,12 @@ ohmd_device* hmdtracker = NULL;
 ohmd_device* lcontroller = NULL;
 ohmd_device* rcontroller = NULL;
 
+float hmd_calib_orient[4] = {0,0,0,1};
+
+struct controller_haptic_state {
+    long haptic_end;
+    char amplitude;
+};
 
 class COpenHMDDeviceDriverController;
 COpenHMDDeviceDriverController *m_OpenHMDDeviceDriverControllerL;
@@ -129,7 +137,7 @@ EVRInitError CWatchdogDriver_OpenHMD::Init( vr::IVRDriverContext *pDriverContext
     // be pressed. A real driver should wait for a system button event or something else from the
     // the hardware that signals that the VR system should start up.
     g_bExiting = false;
-    
+
     DriverLog("starting watchdog thread\n");
 
     m_pWatchdogThread = new std::thread( WatchdogThreadFunction );
@@ -244,7 +252,7 @@ public:
         }
 
         // Create Haptic component
-        // CreateHapticComponent(ulPropertyContainer, "/output/haptic", &component_handles[control_count]);
+        vr::VRDriverInput()->CreateHapticComponent(ulPropertyContainer, "/output/haptic", &component_handles[control_count]);
 
         return VRInitError_None;
     }
@@ -281,6 +289,15 @@ public:
             pchResponseBuffer[0] = 0;
     }
 
+    void UpdateHaptics(const vr::VREvent_HapticVibration_t &hapticData) {
+        haptic_state.haptic_end = (clock() / CLOCKS_PER_MS) + (long)(hapticData.fDurationSeconds * 1000);
+        haptic_state.amplitude = (char)(hapticData.fAmplitude * 255);
+
+        ohmd_device* d = index == 0 ? lcontroller : rcontroller;
+
+        ohmd_device_set_data(d, OHMD_DRIVER_DATA, &haptic_state.amplitude);
+    }
+
     void RunFrame()
     {
         // Update the buttons and triggers
@@ -310,11 +327,49 @@ public:
             }
         }
 
-        printf("Trackpad: X: %f, Y: %f\n", button_values[11], button_values[12]);
+        // Stop the haptics if necessary
+        if (haptic_state.haptic_end < (clock() / CLOCKS_PER_MS)) {
+            // Note, passing null tells the driver to stop rumble
+            ohmd_device_set_data(d, OHMD_DRIVER_DATA, NULL);
+            // psmove_set_rumble(, 0);
+        }
 
-        // TODO Use button_values 0 and 1 to update calibration
+        // Use button_values 0 and 1 to update calibration
+        // Start has been pressed, update hmd calibration
+        if (button_values[1]) {
+            // Get the hmd or tracker device
+            ohmd_device* d2 = hmdtracker ? hmdtracker : hmd;
+
+            // Get the quaternion and write it the hmd_calib_orient
+            ohmd_device_getf(d2, OHMD_ROTATION_QUAT, hmd_calib_orient);
+
+            // Invert the quaternion by flipping the xyz (first 3) components
+            for (int i = 0; i < 3; i++) {
+                hmd_calib_orient[i] = -hmd_calib_orient[i];
+            }
+        }
 
         // TODO Use button_values 2 or 5 to update hmd rotation
+        // int button_index = index == 0 ? 2 : 5;
+        // // TODO This is not correct. It needs to update if the button is pressed, not if it's held
+        // if (button_values[button_index]) {
+        //     // Snap 90 degrees left or right
+        //     float theta = M_PI / 2.0f;
+        //     float rq[4] = {0,1,0,cos(theta / 2.0f)};
+        //
+        //     // If on left controller, flip the quaternion to a anti-clockwise rotation
+        //     if (index != 0) {
+        //         rq[1] = -1.0f;
+        //     }
+        //
+        //     float tmp[4];
+        //     // Multiply orient_snap by rq to form the new value for orient_snap
+        //     quat_mult(orient_snap, rq, tmp);
+        //     // Write tmp (orient_snap * rq) over orient_snap
+        //     for (int i = 0; i < 4; i++) {
+        //         orient_snap[i] = tmp[i];
+        //     }
+        // }
     }
 
     DriverPose_t GetPose()
@@ -325,11 +380,25 @@ public:
         pose.deviceIsConnected = true;
 
         ohmd_device* d = index == 0 ? lcontroller : rcontroller;
-            
+
         ohmd_ctx_update(ctx);
 
         float quat[4];
         ohmd_device_getf(d, OHMD_ROTATION_QUAT, quat);
+
+        // // Rotate the controller by orient_snap
+        // float out_quat[4];
+        // quat_mult(quat, orient_snap, out_quat);
+        //
+        // printf("quat: x: %f y: %f z: %f w: %f\n", quat[0], quat[1], quat[2], quat[3]);
+        // printf("orient_snap: x: %f y: %f z: %f w: %f\n", orient_snap[0], orient_snap[1], orient_snap[2], orient_snap[3]);
+        // printf("out_quat: x: %f y: %f z: %f w: %f\n", out_quat[0], out_quat[1], out_quat[2], out_quat[3]);
+
+        // Set the orientation
+        // pose.qRotation.x = out_quat[0];
+        // pose.qRotation.y = out_quat[1];
+        // pose.qRotation.z = out_quat[2];
+        // pose.qRotation.w = out_quat[3];
         pose.qRotation.x = quat[0];
         pose.qRotation.y = quat[1];
         pose.qRotation.z = quat[2];
@@ -369,7 +438,7 @@ public:
         return false;
     }
 
-    std::string GetSerialNumber() const { 
+    std::string GetSerialNumber() const {
         DriverLog("get controller serial number %s\n", m_sSerialNumber.c_str());
         return m_sSerialNumber;
     }
@@ -383,6 +452,7 @@ private:
     std::string m_sModelNumber = "Controller model number " + std::to_string(index);
 
     VRInputComponentHandle_t* component_handles;
+    struct controller_haptic_state haptic_state;
 };
 
 class COpenHMDDeviceDriver final : public vr::ITrackedDeviceServerDriver, public vr::IVRDisplayComponent
@@ -443,7 +513,7 @@ public:
 
         DriverLog( "Using settings values\n" );
         ohmd_device_getf(hmd, OHMD_EYE_IPD, &m_flIPD);
-        
+
         {
             std::stringstream buf;
             buf << ohmd_list_gets(ctx, 0, OHMD_PRODUCT);
@@ -458,7 +528,7 @@ public:
             buf << ohmd_list_gets(ctx, 0, OHMD_PRODUCT);
             m_sModelNumber = buf.str();
         }
-        
+
         // Important to pass vendor through. Gaze cursor is only available for "Oculus". So grab the first word.
         char const* vendor_override = getenv("OHMD_VENDOR_OVERRIDE");
         if (vendor_override) {
@@ -648,14 +718,14 @@ public:
         sinPitch = -colMatrix[2][0];
         cosPitch = sqrt(1 - sinPitch*sinPitch);
 
-        if ( abs(cosPitch) > 0.1) 
+        if ( abs(cosPitch) > 0.1)
         {
             sinRoll = colMatrix[2][1] / cosPitch;
             cosRoll = colMatrix[2][2] / cosPitch;
             sinYaw = colMatrix[1][0] / cosPitch;
             cosYaw = colMatrix[0][0] / cosPitch;
-        } 
-        else 
+        }
+        else
         {
             sinRoll = -colMatrix[1][2];
             cosRoll = colMatrix[1][1];
@@ -666,8 +736,8 @@ public:
         *yaw   = atan2(sinYaw, cosYaw) * 180 / M_PI;
         *pitch = atan2(sinPitch, cosPitch) * 180 / M_PI;
         *roll  = atan2(sinRoll, cosRoll) * 180 / M_PI;
-    } 
-    
+    }
+
     typedef union {
         float m[4][4];
         float arr[16];
@@ -682,20 +752,20 @@ public:
             o->m[i][3] = a0 * r->m[0][3] + a1 * r->m[1][3] + a2 * r->m[2][3] + a3 * r->m[3][3];
         }
     }
-    
+
     void createUnRotation(float angle, mat4x4f *m) {
         memset(m, 0, sizeof(*m));
         m->m[0][0] = 1.0f;
         m->m[1][1] = 1.0f;
         m->m[2][2] = 1.0f;
         m->m[3][3] = 1.0f;
-        
+
         DriverLog("Unrotating for angle %f\n", angle);
-        
+
         if (angle > -5 && angle < 5) {
             return;
         }
-        
+
         else if (angle > 85 && angle < 95) {
             m->m[0][0] = 0.0f; m->m[0][1] = -1.0f; m->m[1][0] = 1.0f; m->m[1][1] = 0.0f;
             m->m[0][1] = 1.0f; m->m[1][0] = -1.0f;
@@ -704,7 +774,7 @@ public:
         else if (angle > -95 && angle < -85) {
             m->m[0][0] = 0.0f; m->m[0][1] = -1.0f; m->m[1][0] = 1.0f; m->m[1][1] = 0.0f;
         }
-        
+
         else {
             DriverLog("UNIMPLEMENTED ROTATION!!!\n");
         }
@@ -723,24 +793,24 @@ public:
         float p[4][4];
         memcpy(p, ohmdprojection.arr, 16 * sizeof(float));
         columnMatrixToAngles(&yaw, &pitch, &roll, p);
-        
+
         if (eEye == Eye_Left) {
             rotation_left = yaw;
         } else {
             rotation_right = yaw;
         }
-        
+
         mat4x4f unrotation;
         createUnRotation(yaw, &unrotation);
- 
+
         DriverLog("unrotation\n%f %f %f %f\n%f %f %f %f %f\n%f %f %f %f\n%f %f %f %f\n",
             unrotation.arr[0], unrotation.arr[1], unrotation.arr[2], unrotation.arr[3],
             unrotation.arr[4], unrotation.arr[5], unrotation.arr[6], unrotation.arr[7],
             unrotation.arr[8], unrotation.arr[9], unrotation.arr[10], unrotation.arr[11],
             unrotation.arr[12], unrotation.arr[13], unrotation.arr[14], unrotation.arr[15]);
-            
+
         omat4x4f_mult(&ohmdprojection, &unrotation, &ohmdprojection);
-        
+
         // http://stackoverflow.com/questions/10830293/ddg#12926655
         // get projection matrix from openhmd, convert it into lrtb + near,far with SO formula
         // then divide by near plane distance to get the tangents of the angles from the center plane (tan = opposite side = these values divided by adjacent side = near plane distance)
@@ -763,7 +833,7 @@ public:
         *pfTop    = -   (m12+1)/m11;
         *pfLeft   =     (m02-1)/m00;
         *pfRight  =     (m02+1)/m00;
-        
+
         DriverLog("m 00 %f, 11 %f, 22 %f, 12 %f, 02 %f\n", m00, m11, m23, m22, m12, m02);
 
         DriverLog("ohmd projection\n%f %f %f %f\n%f %f %f %f %f\n%f %f %f %f\n%f %f %f %f\n",
@@ -772,18 +842,18 @@ public:
             ohmdprojection.arr[8], ohmdprojection.arr[9], ohmdprojection.arr[10], ohmdprojection.arr[11],
             ohmdprojection.arr[12], ohmdprojection.arr[13], ohmdprojection.arr[14], ohmdprojection.arr[15]
         );
-        
+
         DriverLog("projectionraw values lrtb, near far: %f %f %f %f | %f %f\n", *pfLeft, *pfRight, *pfTop, *pfBottom, near, far);
-        
+
         //DriverLog("angles %f %f %f\n", yaw, pitch, roll);
     }
 
     DistortionCoordinates_t ComputeDistortion( EVREye eEye, float fU, float fV )
     {
         float angle = (eEye == Eye_Left ? rotation_left : rotation_right);
-        
+
         //DriverLog("Eye %d before: %f %f\n", eEye, fU, fV);
-                
+
         if (angle > -5 && angle < 5) {
         } else if (angle > 85 && angle < 95) {
             float tmp = fV;
@@ -799,9 +869,9 @@ public:
             fU = x;
             fV = y;
         }
-        
+
         //DriverLog("Eye %d after: %f %f\n", eEye, fU, fV);
-        
+
         int hmd_w;
         int hmd_h;
         ohmd_device_geti(hmd, OHMD_SCREEN_HORIZONTAL_RESOLUTION, &hmd_w);
@@ -886,12 +956,21 @@ public:
         ohmd_device* d = hmdtracker ? hmdtracker : hmd;
         ohmd_ctx_update(ctx);
 
+        float q[4];
+        ohmd_device_getf(d, OHMD_ROTATION_QUAT, q);
+
+        // Adjust based on hmd_calib_orient
         float quat[4];
-        ohmd_device_getf(d, OHMD_ROTATION_QUAT, quat);
-        pose.qRotation.x = quat[0];
-        pose.qRotation.y = quat[1];
-        pose.qRotation.z = quat[2];
-        pose.qRotation.w = quat[3];
+
+        // Copy the array to make the next few lines less messy
+        for (int i = 0; i < 4; i++)
+            quat[i] = hmd_calib_orient[i];
+
+        // Multiply the hmd orientation by the (inverted) calibration orientation
+        pose.qRotation.x = q[0];//quat[3] * q[0] + quat[0] * q[3] + quat[1] * q[2] - quat[2] * q[1];
+        pose.qRotation.y = quat[3] * q[1] - quat[0] * q[2] + quat[1] * q[3] + quat[2] * q[0];
+        pose.qRotation.z = q[2];//quat[3] * q[2] + quat[0] * q[1] - quat[1] * q[0] + quat[2] * q[3];
+        pose.qRotation.w = q[3];//quat[3] * q[3] - quat[0] * q[0] - quat[1] * q[1] - quat[2] * q[2];
 
         float pos[3];
         ohmd_device_getf(d, OHMD_POSITION_VECTOR, pos);
@@ -930,6 +1009,28 @@ public:
                 vr::VRServerDriverHost()->TrackedDevicePoseUpdated( rcindex, m_OpenHMDDeviceDriverControllerR->GetPose(), sizeof( DriverPose_t ) );
             }
         }
+
+        vr::VREvent_t event;
+        while (vr::VRServerDriverHost()->PollNextEvent(&event, sizeof(event))) {
+            if (event.eventType == vr::VREvent_Input_HapticVibration) {
+                // haptic event details
+                vr::VREvent_HapticVibration_t hapticData = event.data.hapticVibration;
+                vr::TrackedDeviceIndex_t trackedDeviceIndex = event.trackedDeviceIndex;
+
+                // find the trackable device this vibration event is intended for by property container handle
+                if (trackedDeviceIndex == lcindex) {
+                    // Left controller
+                    if (m_OpenHMDDeviceDriverControllerL->exists()) {
+                        m_OpenHMDDeviceDriverControllerL->UpdateHaptics(hapticData);
+                    }
+                } else {
+                    // Right controller
+                    if (m_OpenHMDDeviceDriverControllerR->exists()) {
+                        m_OpenHMDDeviceDriverControllerR->UpdateHaptics(hapticData);
+                    }
+                }
+            }
+        }
     }
 
     std::string GetSerialNumber() const { return m_sSerialNumber; }
@@ -951,7 +1052,7 @@ private:
     float m_flSecondsFromVsyncToPhotons;
     float m_flDisplayFrequency;
     float m_flIPD;
-    
+
     float rotation_left = 0.0;
     float rotation_right = 0.0;
 };
